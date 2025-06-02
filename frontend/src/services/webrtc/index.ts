@@ -1,4 +1,4 @@
-// WebRTC service for connecting to OpenAI's Realtime API
+// WebRTC service for connecting to OpenAI's Realtime API in transcription mode
 import { getEphemeralToken } from '../api';
 
 export interface TranscriptionOptions {
@@ -37,7 +37,6 @@ export class RealtimeTranscriptionService {
       console.log('Token response:', tokenResponse);
       
       // Extract the ephemeral token value from the client_secret object
-      // This matches the OpenAI API response format
       if (!tokenResponse.client_secret || !tokenResponse.client_secret.value) {
         throw new Error('Invalid token response from server');
       }
@@ -70,14 +69,12 @@ export class RealtimeTranscriptionService {
       await this.peerConnection.setLocalDescription(offer);
       
       // Step 7: Exchange SDP with OpenAI Realtime API
-      // Use the intent parameter for transcription as shown in the documentation
       const baseUrl = 'https://api.openai.com/v1/realtime';
-      const intentParam = 'intent=transcription';
       
-      console.log('Sending SDP to OpenAI with URL:', `${baseUrl}?${intentParam}`);
+      console.log('Sending SDP to OpenAI with URL:', baseUrl);
       console.log('Using ephemeral token:', this.ephemeralToken ? this.ephemeralToken.substring(0, 10) + '...' : 'none');
       
-      const sdpResponse = await fetch(`${baseUrl}?${intentParam}`, {
+      const sdpResponse = await fetch(baseUrl, {
         method: 'POST',
         body: this.peerConnection.localDescription?.sdp,
         headers: {
@@ -103,10 +100,46 @@ export class RealtimeTranscriptionService {
       this.peerConnection.addEventListener('connectionstatechange', this.handleConnectionStateChange);
       
       options.onStatusChange('connected');
+      
+      // Send initial session update to configure for transcription-only mode
+      this.sendSessionUpdate();
+      
     } catch (error) {
       options.onStatusChange('error');
       options.onError(error instanceof Error ? error : new Error(String(error)));
       this.stopTranscription();
+    }
+  }
+
+  /**
+   * Send session update to configure for transcription-only mode
+   */
+  private sendSessionUpdate(): void {
+    if (!this.dataChannel) return;
+    
+    const sessionUpdate = {
+      type: 'session.update',
+      session: {
+        instructions: "You are a transcription assistant. Only transcribe what you hear. Do not respond, engage in conversation, or generate any replies. Simply provide accurate transcriptions of the audio input.",
+        modalities: ["text", "audio"],
+        input_audio_transcription: {
+          model: "whisper-1"
+        },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 1200
+        },
+        tool_choice: "none"
+      }
+    };
+    
+    try {
+      this.dataChannel.send(JSON.stringify(sessionUpdate));
+      console.log('Sent session update for transcription mode');
+    } catch (error) {
+      console.error('Error sending session update:', error);
     }
   }
 
@@ -154,32 +187,45 @@ export class RealtimeTranscriptionService {
       console.log('Received event:', data);
       
       switch (data.type) {
-        // Handle the response.audio_transcript.delta events which contain real-time transcription
-        case 'response.audio_transcript.delta':
-          this.options.onTranscription(data.delta, false);
+        // Handle input audio transcription events - these contain the transcribed text
+        case 'conversation.item.input_audio_transcription.completed':
+          // This event contains the final transcription
+          if (data.transcript) {
+            this.options.onTranscription(data.transcript, true);
+          }
           break;
           
-        // Handle the response.audio_transcript.done events which contain the complete transcription
-        case 'response.audio_transcript.done':
-          this.options.onTranscription(data.transcript, true);
+        case 'input_audio_buffer.speech_started':
+          console.log('Speech detected');
           break;
           
-        // Original event type from before
-        case 'transcription':
-          this.options.onTranscription(data.text, !!data.final);
+        case 'input_audio_buffer.speech_stopped':
+          console.log('Speech ended');
+          break;
+          
+        case 'session.updated':
+          console.log('Session updated:', data.session);
           break;
           
         case 'error':
-          this.options.onError(new Error(data.message || 'Unknown transcription error'));
+          this.options.onError(new Error(data.error?.message || 'Unknown transcription error'));
           break;
           
-        case 'connected':
-        case 'session_begins':
-          // These are informational events, no action needed
+        case 'session.created':
+          console.log('Session created successfully');
+          break;
+          
+        // Ignore response events since we only want transcription
+        case 'response.created':
+        case 'response.done':
+        case 'response.output_item.added':
+        case 'response.content_part.added':
+        case 'response.audio.delta':
+        case 'response.audio.done':
+          console.log('Ignoring response event:', data.type);
           break;
           
         default:
-          // Log unhandled event types for debugging, but don't display an error
           console.log('Unhandled event type:', data.type, data);
       }
     } catch (error) {
